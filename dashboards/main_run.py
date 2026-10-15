@@ -1,65 +1,107 @@
-"""Application entry point for dashboard workflows."""
-
 import numpy as np
 import xgboost as xgb
-from sklearn.metrics import mean_squared_error
+import pandas as pd
 import warnings
 
 from data.data_engineering import generate_synthetic_market_data, compute_advanced_features
-from calibration.model_pipeline import PurgedGroupTimeSeriesSplit, backtest_delta_neutral_strategy
+from calibration.model_pipeline import PurgedGroupTimeSeriesSplit, backtest_multi_structure_strategy
 
 warnings.filterwarnings('ignore')
 
+CLASS_MAP = {
+    0: 'NO_TRADE',
+    1: 'IRON_CONDOR',
+    2: 'LONG_STRANGLE',
+    3: 'RISK_REVERSAL'
+}
+
 def main():
-    print("1. Génération des données synthétiques (Modèle de Heston)...")
+    print("1. Génération des données synthétiques...")
     raw_df = generate_synthetic_market_data(n_days=1500)
     
-    print("2. Calcul des features et Target de régression...")
+    print("2. Calcul des features et Target Multi-Classes...")
     df_features = compute_advanced_features(raw_df)
     
-    features = ['RV_GarmanKlass', 'Vol_Premium', 'Spread_ZScore', 'GEX_Normalized', 'Skew_Momentum', 'IV_Term_Structure']
+    features = [
+        'RV_GarmanKlass', 'Vol_Premium', 'Spread_ZScore', 
+        'GEX_Normalized', 'Skew_Momentum', 'IV_Term_Structure', 'IV_EWMA_Diff'
+    ]
     X = df_features[features]
     y = df_features['Target']
     
-    print("3. Entraînement ML via Purged CV (Régression)...")
+    print("3. Entraînement XGBClassifier Multi-Classes (Configuration Référence)...")
     cv = PurgedGroupTimeSeriesSplit(n_splits=5, purge_window=5, embargo_window=5)
     
-    model = xgb.XGBRegressor(
-        n_estimators=150, max_depth=3, learning_rate=0.03,
-        subsample=0.8, colsample_bytree=0.8, random_state=42
+    model = xgb.XGBClassifier(
+        n_estimators=100, max_depth=3, learning_rate=0.03,
+        subsample=0.8, colsample_bytree=0.8,
+        objective='multi:softprob', num_class=4, random_state=42
     )
     
-    all_daily_pnls = []
+    prob_grid = [0.30, 0.35, 0.40, 0.45, 0.50]
+    results_table = []
     
-    for fold_idx, (train_idx, test_idx) in enumerate(cv.split(X)):
-        X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
-        y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+    for prob_thresh in prob_grid:
+        all_daily_pnls = []
         
-        model.fit(X_train, y_train)
-        preds = model.predict(X_test)
+        for fold_idx, (train_idx, test_idx) in enumerate(cv.split(X)):
+            X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+            y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+            
+            model.fit(X_train, y_train)
+            proba_matrix = model.predict_proba(X_test)
+            
+            df_test_period = df_features.iloc[test_idx]
+            
+            strategy_signals = []
+            position_sizes = []
+            cooldown_counter = 0
+            
+            for i in range(len(proba_matrix)):
+                if cooldown_counter > 0:
+                    strategy_signals.append('NO_TRADE')
+                    position_sizes.append(0.0)
+                    cooldown_counter -= 1
+                    continue
+                    
+                probs = proba_matrix[i]
+                best_class = int(np.argmax(probs))
+                max_p = probs[best_class]
+                
+                if best_class != 0 and max_p >= prob_thresh:
+                    strat = CLASS_MAP[best_class]
+                    size = np.clip(max_p * 2.5, 1.0, 2.0)
+                    cooldown_counter = 3
+                else:
+                    strat = 'NO_TRADE'
+                    size = 0.0
+                    
+                strategy_signals.append(strat)
+                position_sizes.append(size)
+                
+            daily_pnls = backtest_multi_structure_strategy(
+                df_test_period, strategy_signals, position_sizes=position_sizes, holding_period=5
+            )
+            all_daily_pnls.extend(daily_pnls)
         
-        signals = (preds < -0.01).astype(int)
+        all_daily_pnls = np.array(all_daily_pnls)
+        total_pnl = np.sum(all_daily_pnls)
+        sharpe_ratio = (np.mean(all_daily_pnls) / (np.std(all_daily_pnls) + 1e-8)) * np.sqrt(252)
+        max_drawdown = np.max(np.maximum.accumulate(np.cumsum(all_daily_pnls)) - np.cumsum(all_daily_pnls))
         
-        mse = mean_squared_error(y_test, preds)
-        print(f"   Fold {fold_idx+1} - MSE: {mse:.6f} | Trades déclenchés : {np.sum(signals)}")
-        
-        df_test_period = df_features.iloc[test_idx]
-        daily_pnls = backtest_delta_neutral_strategy(df_test_period, signals)
-        all_daily_pnls.extend(daily_pnls)
-    
-    print("\n4. Agrégation des résultats du backtest...")
-    all_daily_pnls = np.array(all_daily_pnls)
-    total_pnl = np.sum(all_daily_pnls)
-    sharpe_ratio = (np.mean(all_daily_pnls) / (np.std(all_daily_pnls) + 1e-8)) * np.sqrt(252)
-    max_drawdown = np.max(np.maximum.accumulate(np.cumsum(all_daily_pnls)) - np.cumsum(all_daily_pnls))
-    
-    print("\n" + "="*50)
-    print("   RÉSULTATS DE LA STRATÉGIE (PRICER NUMBA)")
-    print("="*50)
-    print(f"   PnL Cumulé Net :         ${total_pnl:.2f}")
-    print(f"   Ratio de Sharpe Annuel :  {sharpe_ratio:.2f}")
-    print(f"   Max Drawdown ($) :        ${max_drawdown:.2f}")
-    print("="*50)
+        results_table.append({
+            'Seuil Confiance (p*)': f"Prob >= {prob_thresh}",
+            'PnL Cumulé ($)': round(total_pnl, 2),
+            'Ratio de Sharpe': round(sharpe_ratio, 2),
+            'Max Drawdown ($)': round(max_drawdown, 2)
+        })
+
+    print("\n" + "="*65)
+    print("   RÉSULTATS DE RÉFÉRENCE - CLASSIFICATION MULTI-CLASSES (PURE)")
+    print("="*65)
+    df_res = pd.DataFrame(results_table)
+    print(df_res.to_string(index=False))
+    print("="*65)
 
 if __name__ == "__main__":
     main()

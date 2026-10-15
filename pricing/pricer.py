@@ -5,9 +5,7 @@ from numba import njit
 
 @njit
 def _trinomial_backward_induction(N, dt, r, pu, pm, pd_prob, df, S_clean, u, div_times, div_amounts, T, K, is_call, V):
-    delta_val = 0.0
-    gamma_val = 0.0
-    
+    delta_val, gamma_val = 0.0, 0.0
     for i in range(N - 1, -1, -1):
         t_current = i * dt
         n_nodes = 2 * i + 1
@@ -23,30 +21,21 @@ def _trinomial_backward_induction(N, dt, r, pu, pm, pd_prob, df, S_clean, u, div
             j_exp = i - j
             S_true = S_clean * (u ** j_exp) + pv_divs_current
             S_true_nodes[j] = S_true
-            
             v_cont = df * (pu * V[j] + pm * V[j+1] + pd_prob * V[j+2])
-            
-            if is_call == 1:
-                v_ex = max(0.0, S_true - K)
-            else:
-                v_ex = max(0.0, K - S_true)
-                
+            v_ex = max(0.0, S_true - K) if is_call == 1 else max(0.0, K - S_true)
             V_new[j] = max(v_cont, v_ex)
         
         V = V_new
-        
         if i == 1:
             dS = S_true_nodes[0] - S_true_nodes[2]
-            if dS != 0:
-                delta_val = (V[0] - V[2]) / dS
+            if dS != 0: delta_val = (V[0] - V[2]) / dS
             h1 = S_true_nodes[0] - S_true_nodes[1]
             h2 = S_true_nodes[1] - S_true_nodes[2]
-            if h1 > 0 and h2 > 0:
-                gamma_val = 2 * ((V[0] - V[1]) / h1 - (V[1] - V[2]) / h2) / (h1 + h2)
+            if h1 > 0 and h2 > 0: gamma_val = 2 * ((V[0] - V[1]) / h1 - (V[1] - V[2]) / h2) / (h1 + h2)
                 
     return V[0], delta_val, gamma_val
 
-def american_trinomial_option_price_and_greeks(S, K, T, r, div_schedule, sigma, option_type='call', N=100):
+def american_trinomial_option_price_and_greeks(S, K, T, r, div_schedule, sigma, option_type='call', N=60, compute_vega=False):
     if T <= 0 or sigma <= 0:
         val = max(0, S - K) if option_type == 'call' else max(0, K - S)
         return {'price': val, 'delta': 0, 'gamma': 0, 'vega': 0}
@@ -69,10 +58,7 @@ def american_trinomial_option_price_and_greeks(S, K, T, r, div_schedule, sigma, 
     ST = ST_clean + sum([D for t_div, D in div_schedule if t_div > T])
 
     is_call = 1 if option_type == 'call' else 0
-    if is_call == 1:
-        V = np.maximum(0, ST - K)
-    else:
-        V = np.maximum(0, K - ST)
+    V = np.maximum(0, ST - K) if is_call == 1 else np.maximum(0, K - ST)
 
     div_times = np.array([d[0] for d in div_schedule]) if div_schedule else np.array([])
     div_amounts = np.array([d[1] for d in div_schedule]) if div_schedule else np.array([])
@@ -81,7 +67,24 @@ def american_trinomial_option_price_and_greeks(S, K, T, r, div_schedule, sigma, 
         N, dt, r, pu, pm, pd_prob, df_factor, S_clean, u, div_times, div_amounts, T, K, is_call, V
     )
 
-    v_up = american_trinomial_option_price_and_greeks(S, K, T, r, div_schedule, sigma + 0.01, option_type, N)['price']
-    vega_val = v_up - price
+    vega_val = 0.0
+    if compute_vega:
+        v_up = american_trinomial_option_price_and_greeks(S, K, T, r, div_schedule, sigma + 0.01, option_type, N, compute_vega=False)['price']
+        vega_val = v_up - price
 
     return {'price': price, 'delta': delta_val, 'gamma': gamma_val, 'vega': vega_val}
+
+def find_strike_for_target_delta(S, target_delta, T, r, div_schedule, sigma, option_type='call', N=60):
+    """Optimisation Numérique : Méthode de la Bisection pour cibler le Delta exact."""
+    low_K, high_K = S * 0.5, S * 1.5
+    for _ in range(15):  # Plus précis et plus rapide que la boucle naïve
+        mid_K = (low_K + high_K) / 2
+        current_delta = american_trinomial_option_price_and_greeks(S, mid_K, T, r, div_schedule, sigma, option_type, N)['delta']
+        
+        if option_type == 'call':
+            if current_delta > target_delta: low_K = mid_K
+            else: high_K = mid_K
+        else:
+            if current_delta < target_delta: low_K = mid_K
+            else: high_K = mid_K
+    return (low_K + high_K) / 2
