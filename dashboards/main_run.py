@@ -18,12 +18,10 @@ CLASS_MAP = {
     5: 'DIAGONAL_SPREAD'
 }
 
-def main():
+def run_single_experiment(seed=42, market_regime='BULL_STABLE', verbose=False):
     assets = ['SPY', 'QQQ', 'IWM']
-    print(f"1. Génération des données synthétiques Multi-Actifs ({', '.join(assets)})...")
-    raw_market_data = generate_multi_asset_market_data(n_days=1500, assets=assets)
+    raw_market_data = generate_multi_asset_market_data(n_days=1500, assets=assets, seed=seed, market_regime=market_regime)
     
-    print("2. Calcul des features et Target Multi-Classes par actif...")
     features_by_asset = {}
     for asset in assets:
         features_by_asset[asset] = compute_advanced_features(raw_market_data[asset])
@@ -46,11 +44,8 @@ def main():
     cv = PurgedGroupTimeSeriesSplit(n_splits=5, purge_window=5, embargo_window=5)
     
     prob_thresh = 0.45
-    K_max = 3  # Fixé à K = 3 pour un Sharpe optimal de 1.26
-    
+    K_max = 3
     all_daily_pnls = []
-    
-    print(f"3. Entraînement ML & Backtest Multi-Actifs avec Allocation Top-K (K = {K_max})...")
 
     for fold_idx, (train_idx, test_idx) in enumerate(cv.split(X_ref)):
         test_dates = ref_asset_df.index[test_idx]
@@ -84,7 +79,6 @@ def main():
         
         for t in range(n_test_days):
             candidates = []
-            
             for asset in assets:
                 if t < len(proba_by_asset[asset]):
                     probs = proba_by_asset[asset][t]
@@ -93,24 +87,16 @@ def main():
                     real_class = le.inverse_transform([best_class_enc])[0]
                     
                     if real_class != 0 and p_val >= prob_thresh:
-                        candidates.append({
-                            'asset': asset,
-                            'prob': p_val,
-                            'strat': CLASS_MAP[real_class]
-                        })
+                        candidates.append({'asset': asset, 'prob': p_val, 'strat': CLASS_MAP[real_class]})
             
-            # Tri par conviction et conservation des K=3 meilleures opportunités
             candidates = sorted(candidates, key=lambda x: x['prob'], reverse=True)[:K_max]
             
             if len(candidates) > 0:
-                # Division égale de l'exposition globale (3.5x max) entre les actifs sélectionnés
                 size_per_trade = 3.5 / len(candidates)
                 day_pnl_sum = 0.0
-                
                 for cand in candidates:
                     single_position_sizes = [0.0] * n_test_days
                     single_position_sizes[t] = size_per_trade
-                    
                     pnl_arr = backtest_cross_asset_strategy(
                         market_data_test, 
                         [(cand['strat'], cand['asset']) if i == t else ('NO_TRADE', None) for i in range(n_test_days)],
@@ -118,7 +104,6 @@ def main():
                         holding_period=5
                     )
                     day_pnl_sum += pnl_arr[t] if t < len(pnl_arr) else 0.0
-                    
                 fold_daily_pnls[t] = day_pnl_sum
             else:
                 fold_daily_pnls[t] = 0.0
@@ -130,13 +115,19 @@ def main():
     sharpe_ratio = (np.mean(all_daily_pnls) / (np.std(all_daily_pnls) + 1e-8)) * np.sqrt(252)
     max_drawdown = np.max(np.maximum.accumulate(np.cumsum(all_daily_pnls)) - np.cumsum(all_daily_pnls))
     
-    print("\n" + "="*65)
-    print("   RÉSULTATS DE L'ARBITRAGE CROSS-ASSET OPTIMAL (TOP-3 SELECTION)")
-    print("="*65)
-    print(f"   PnL Cumulé Net :         ${total_pnl:.2f}")
-    print(f"   Ratio de Sharpe Annuel :  {sharpe_ratio:.2f}")
-    print(f"   Max Drawdown ($) :        ${max_drawdown:.2f}")
-    print("="*65)
+    if verbose:
+        print("\n" + "="*65)
+        print(f"   EVALUATION UNIQUE | Regime: {market_regime} | Seed: {seed}")
+        print("="*65)
+        print(f"   PnL Cumulé Net :         ${total_pnl:.2f}")
+        print(f"   Ratio de Sharpe Annuel :  {sharpe_ratio:.2f}")
+        print(f"   Max Drawdown ($) :        ${max_drawdown:.2f}")
+        print("="*65)
+        
+    return total_pnl, sharpe_ratio, max_drawdown
+
+def main():
+    run_single_experiment(seed=42, market_regime='BULL_STABLE', verbose=True)
 
 if __name__ == "__main__":
     main()

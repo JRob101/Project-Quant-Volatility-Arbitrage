@@ -23,14 +23,9 @@ class PurgedGroupTimeSeriesSplit:
 
 
 def backtest_cross_asset_strategy(market_data_test, asset_signals, position_sizes=None, holding_period=5, delta_tolerance=0.08):
-    """
-    Backtest multi-actifs (Cross-Asset) avec rééquilibrage Delta et MTM multi-échéances.
-    asset_signals est une liste de tuples : (strat_name, asset_name)
-    """
     r = 0.04
     pnl_history = []
     
-    # Récupérer la taille de l'horizon de test à partir du premier actif
     first_asset = list(market_data_test.keys())[0]
     n_days = len(market_data_test[first_asset])
     

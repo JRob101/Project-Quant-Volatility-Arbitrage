@@ -5,28 +5,46 @@ import pandas as pd
 from pricing.pricer import american_trinomial_option_price_and_greeks, find_strike_for_target_delta
 
 
-def generate_multi_asset_market_data(n_days=1500, assets=['SPY', 'QQQ', 'IWM']):
-    """
-    Génère un dictionnaire de DataFrames pour plusieurs actifs corrélés 
-    via un modèle de Heston Vectoriel (Corrélation inter-actifs par Cholesky).
-    """
-    np.random.seed(42)
+REGIME_PARAMS = {
+    'BULL_STABLE': {
+        'SPY': {'S0': 400, 'mu': 0.08, 'kappa': 5.0, 'theta': 0.020, 'xi': 0.25, 'rho': -0.60},
+        'QQQ': {'S0': 350, 'mu': 0.09, 'kappa': 4.5, 'theta': 0.030, 'xi': 0.30, 'rho': -0.55},
+        'IWM': {'S0': 200, 'mu': 0.06, 'kappa': 5.5, 'theta': 0.025, 'xi': 0.30, 'rho': -0.65}
+    },
+    'BEAR_STRESS': {
+        'SPY': {'S0': 400, 'mu': -0.12, 'kappa': 3.0, 'theta': 0.080, 'xi': 0.60, 'rho': -0.80},
+        'QQQ': {'S0': 350, 'mu': -0.15, 'kappa': 2.5, 'theta': 0.100, 'xi': 0.70, 'rho': -0.75},
+        'IWM': {'S0': 200, 'mu': -0.10, 'kappa': 3.5, 'theta': 0.090, 'xi': 0.65, 'rho': -0.85}
+    },
+    'HIGH_VOL_OF_VOL': {
+        'SPY': {'S0': 400, 'mu': 0.02, 'kappa': 2.0, 'theta': 0.040, 'xi': 0.80, 'rho': -0.70},
+        'QQQ': {'S0': 350, 'mu': 0.03, 'kappa': 1.8, 'theta': 0.050, 'xi': 0.90, 'rho': -0.65},
+        'IWM': {'S0': 200, 'mu': 0.01, 'kappa': 2.2, 'theta': 0.045, 'xi': 0.85, 'rho': -0.75}
+    },
+    'JUMP_CRASH': {
+        'SPY': {'S0': 400, 'mu': -0.05, 'kappa': 3.5, 'theta': 0.050, 'xi': 0.45, 'rho': -0.75},
+        'QQQ': {'S0': 350, 'mu': -0.06, 'kappa': 3.0, 'theta': 0.065, 'xi': 0.50, 'rho': -0.70},
+        'IWM': {'S0': 200, 'mu': -0.04, 'kappa': 4.0, 'theta': 0.060, 'xi': 0.45, 'rho': -0.80}
+    }
+}
+
+
+def generate_multi_asset_market_data(n_days=1500, assets=['SPY', 'QQQ', 'IWM'], seed=None, market_regime='BULL_STABLE'):
+    if seed is not None:
+        np.random.seed(seed)
+    else:
+        np.random.seed()
+        
     dates = pd.date_range(start='2022-01-01', periods=n_days, freq='B')
     n_assets = len(assets)
     dt = 1 / 252
     
-    # Paramètres de Heston spécifiques par actif
-    params = {
-        'SPY': {'S0': 400, 'mu': 0.04, 'kappa': 4.0, 'theta': 0.035, 'xi': 0.35, 'rho': -0.70},
-        'QQQ': {'S0': 350, 'mu': 0.05, 'kappa': 3.5, 'theta': 0.050, 'xi': 0.45, 'rho': -0.65},
-        'IWM': {'S0': 200, 'mu': 0.03, 'kappa': 4.5, 'theta': 0.045, 'xi': 0.40, 'rho': -0.75}
-    }
+    regime = REGIME_PARAMS.get(market_regime, REGIME_PARAMS['BULL_STABLE'])
     
-    # Matrice de corrélation inter-actifs (Prix)
     corr_matrix_S = np.array([
-        [1.00, 0.85, 0.75],  # SPY vs (SPY, QQQ, IWM)
-        [0.85, 1.00, 0.70],  # QQQ vs (SPY, QQQ, IWM)
-        [0.75, 0.70, 1.00]   # IWM vs (SPY, QQQ, IWM)
+        [1.00, 0.85, 0.75],
+        [0.85, 1.00, 0.70],
+        [0.75, 0.70, 1.00]
     ])
     
     L_S = np.linalg.cholesky(corr_matrix_S)
@@ -37,31 +55,36 @@ def generate_multi_asset_market_data(n_days=1500, assets=['SPY', 'QQQ', 'IWM']):
     low = {asset: np.zeros(n_days) for asset in assets}
     
     for asset in assets:
-        S[asset][0] = params[asset]['S0']
-        v[asset][0] = params[asset]['theta']
+        S[asset][0] = regime[asset]['S0']
+        v[asset][0] = regime[asset]['theta']
         
+    lambda_j = 4.0 if market_regime == 'JUMP_CRASH' else 0.0
+    mu_j, sigma_j = -0.06, 0.08
+    
     for t in range(1, n_days):
         Z_S_indep = np.random.normal(0, 1, n_assets)
         Z_v_indep = np.random.normal(0, 1, n_assets)
-        
         W1 = L_S @ Z_S_indep
         
+        jumps_count = np.random.poisson(lambda_j * dt, n_assets) if lambda_j > 0 else np.zeros(n_assets)
+        jumps_size = np.random.normal(mu_j, sigma_j, n_assets) * jumps_count
+        
         for i, asset in enumerate(assets):
-            p = params[asset]
+            p = regime[asset]
             v_prev = max(v[asset][t-1], 1e-6)
-            
             W2 = p['rho'] * W1[i] + np.sqrt(1 - p['rho']**2) * Z_v_indep[i]
             
-            S[asset][t] = S[asset][t-1] * np.exp((p['mu'] - 0.5 * v_prev) * dt + np.sqrt(v_prev * dt) * W1[i])
+            S[asset][t] = S[asset][t-1] * np.exp((p['mu'] - 0.5 * v_prev) * dt + np.sqrt(v_prev * dt) * W1[i] + jumps_size[i])
             v[asset][t] = v_prev + p['kappa'] * (p['theta'] - v_prev) * dt + p['xi'] * np.sqrt(v_prev * dt) * W2
             
             intra_vol = np.sqrt(max(v[asset][t], 1e-6) * dt)
-            high[asset][t] = S[asset][t] * (1 + np.abs(np.random.normal(0, intra_vol * 0.4)))
-            low[asset][t] = S[asset][t-1] * (1 - np.abs(np.random.normal(0, intra_vol * 0.4)))
+            jump_impact = abs(jumps_size[i]) if jumps_size[i] != 0 else 0
+            high[asset][t] = S[asset][t] * (1 + np.abs(np.random.normal(0, intra_vol * 0.4)) + jump_impact)
+            low[asset][t] = S[asset][t-1] * (1 - np.abs(np.random.normal(0, intra_vol * 0.4)) - jump_impact)
 
     market_data = {}
     for asset in assets:
-        p = params[asset]
+        p = regime[asset]
         open_p = np.roll(S[asset], 1)
         open_p[0] = S[asset][0]
         
