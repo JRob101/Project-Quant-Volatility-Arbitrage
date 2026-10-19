@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 from pricing.pricer import american_trinomial_option_price_and_greeks, find_strike_for_target_delta
 
-
+# Paramètres des 4 régimes de marché
 REGIME_PARAMS = {
     'BULL_STABLE': {
         'SPY': {'S0': 400, 'mu': 0.08, 'kappa': 5.0, 'theta': 0.020, 'xi': 0.25, 'rho': -0.60},
@@ -28,8 +28,22 @@ REGIME_PARAMS = {
     }
 }
 
+# Matrice de transition de Markov journalière entre régimes
+REGIME_NAMES = ['BULL_STABLE', 'BEAR_STRESS', 'HIGH_VOL_OF_VOL', 'JUMP_CRASH']
+
+TRANSITION_MATRIX = np.array([
+    # BULL   BEAR   HIGH_VOL  JUMP
+    [0.985, 0.010,  0.004,   0.001],  # De BULL_STABLE
+    [0.020, 0.960,  0.015,   0.005],  # De BEAR_STRESS
+    [0.015, 0.025,  0.950,   0.010],  # De HIGH_VOL_OF_VOL
+    [0.050, 0.150,  0.100,   0.700]   # De JUMP_CRASH
+])
+
 
 def generate_multi_asset_market_data(n_days=1500, assets=['SPY', 'QQQ', 'IWM'], seed=None, market_regime='BULL_STABLE'):
+    """
+    Générateur statique par régime (Conservé pour rétro-compatibilité).
+    """
     if seed is not None:
         np.random.seed(seed)
     else:
@@ -46,7 +60,6 @@ def generate_multi_asset_market_data(n_days=1500, assets=['SPY', 'QQQ', 'IWM'], 
         [0.85, 1.00, 0.70],
         [0.75, 0.70, 1.00]
     ])
-    
     L_S = np.linalg.cholesky(corr_matrix_S)
     
     S = {asset: np.zeros(n_days) for asset in assets}
@@ -105,7 +118,139 @@ def generate_multi_asset_market_data(n_days=1500, assets=['SPY', 'QQQ', 'IWM'], 
     return market_data
 
 
+def generate_dynamic_market_data(n_days=1260, assets=['SPY', 'QQQ', 'IWM'], seed=None, verbose=True):
+    """
+    Génère des séries temporelles multi-actifs sous un modèle à changement de régime dynamique (Markov-Switching).
+    Affiche la séquence et la répartition des régimes générés dans le terminal.
+    """
+    if seed is not None:
+        np.random.seed(seed)
+    else:
+        np.random.seed()
+        
+    dates = pd.date_range(start='2020-01-01', periods=n_days, freq='B')
+    n_assets = len(assets)
+    dt = 1 / 252
+    
+    # 1. Simulation de la chaîne de Markov pour la séquence des régimes sur 5 ans
+    current_regime_idx = 0  # Démarrage en BULL_STABLE
+    regime_history = [current_regime_idx]
+    
+    for t in range(1, n_days):
+        current_regime_idx = np.random.choice(
+            len(REGIME_NAMES), 
+            p=TRANSITION_MATRIX[current_regime_idx]
+        )
+        regime_history.append(current_regime_idx)
+        
+    regime_series = [REGIME_NAMES[r] for r in regime_history]
+
+    # Affichage de la séquence et des statistiques de régimes dans la console
+    if verbose:
+        counts = pd.Series(regime_series).value_counts()
+        print("\n" + "="*65)
+        print("   SÉQUENCE DYNAMIQUE DES RÉGIMES DE MARCHÉ (MARKOV-SWITCHING)")
+        print("="*65)
+        print("Répartition temporelle sur la période simulée :")
+        for reg in REGIME_NAMES:
+            c = counts.get(reg, 0)
+            pct = (c / n_days) * 100
+            print(f"  • {reg:<16} : {c:4d} jours ({pct:5.1f}%)")
+        
+        # Détection et affichage des transitions
+        transitions = []
+        curr = regime_series[0]
+        start_date = dates[0]
+        
+        for i in range(1, n_days):
+            if regime_series[i] != curr:
+                transitions.append((curr, start_date.strftime('%Y-%m-%d'), dates[i-1].strftime('%Y-%m-%d')))
+                curr = regime_series[i]
+                start_date = dates[i]
+        transitions.append((curr, start_date.strftime('%Y-%m-%d'), dates[-1].strftime('%Y-%m-%d')))
+        
+        print("\nSéquence des phases de marché détectées :")
+        for t_reg, t_start, t_end in transitions[:10]:
+            print(f"  - [{t_start} -> {t_end}] : {t_reg}")
+        if len(transitions) > 10:
+            print(f"  ... (+ {len(transitions) - 10} autres transitions)")
+        print("="*65 + "\n")
+
+    # 2. Simulation de la dynamique sous régime changeant
+    S = {asset: np.zeros(n_days) for asset in assets}
+    v = {asset: np.zeros(n_days) for asset in assets}
+    high = {asset: np.zeros(n_days) for asset in assets}
+    low = {asset: np.zeros(n_days) for asset in assets}
+    
+    corr_matrix_S = np.array([
+        [1.00, 0.85, 0.75],
+        [0.85, 1.00, 0.70],
+        [0.75, 0.70, 1.00]
+    ])
+    L_S = np.linalg.cholesky(corr_matrix_S)
+    
+    init_regime = REGIME_PARAMS['BULL_STABLE']
+    for asset in assets:
+        S[asset][0] = init_regime[asset]['S0']
+        v[asset][0] = init_regime[asset]['theta']
+        
+    for t in range(1, n_days):
+        reg_name = regime_series[t]
+        regime = REGIME_PARAMS[reg_name]
+        
+        Z_S_indep = np.random.normal(0, 1, n_assets)
+        Z_v_indep = np.random.normal(0, 1, n_assets)
+        W1 = L_S @ Z_S_indep
+        
+        lambda_j = 4.0 if reg_name == 'JUMP_CRASH' else 0.0
+        mu_j, sigma_j = -0.06, 0.08
+        jumps_count = np.random.poisson(lambda_j * dt, n_assets) if lambda_j > 0 else np.zeros(n_assets)
+        jumps_size = np.random.normal(mu_j, sigma_j, n_assets) * jumps_count
+        
+        for i, asset in enumerate(assets):
+            p = regime[asset]
+            v_prev = max(v[asset][t-1], 1e-6)
+            
+            # W2 est calculé comme un scalaire pour l'actif courant 'i'
+            W2 = p['rho'] * W1[i] + np.sqrt(1 - p['rho']**2) * Z_v_indep[i]
+            
+            # Correction : utiliser W2 directement (et non W2[i])
+            S[asset][t] = S[asset][t-1] * np.exp((p['mu'] - 0.5 * v_prev) * dt + np.sqrt(v_prev * dt) * W1[i] + jumps_size[i])
+            v[asset][t] = v_prev + p['kappa'] * (p['theta'] - v_prev) * dt + p['xi'] * np.sqrt(v_prev * dt) * W2
+            
+            intra_vol = np.sqrt(max(v[asset][t], 1e-6) * dt)
+            jump_impact = abs(jumps_size[i]) if jumps_size[i] != 0 else 0
+            high[asset][t] = S[asset][t] * (1 + np.abs(np.random.normal(0, intra_vol * 0.4)) + jump_impact)
+            low[asset][t] = S[asset][t-1] * (1 - np.abs(np.random.normal(0, intra_vol * 0.4)) - jump_impact)
+
+    # 3. Assemblage du dictionnaire
+    market_data = {}
+    for asset in assets:
+        open_p = np.roll(S[asset], 1)
+        open_p[0] = S[asset][0]
+        
+        iv_atm = np.sqrt(np.maximum(v[asset], 1e-6)) + 0.015 + np.random.normal(0, 0.005, n_days)
+        iv_skew = 0.05 + np.random.normal(0, 0.01, n_days)
+        term_structure = 0.02 + np.random.normal(0, 0.005, n_days)
+        bid_ask_spread = 0.0001 + (iv_atm * 0.0005)
+        
+        df = pd.DataFrame({
+            'Date': dates, 'Open': open_p, 'High': high[asset], 'Low': low[asset], 'Close': S[asset],
+            'IV_ATM': iv_atm, 'IV_Skew': iv_skew, 'IV_Term_Structure': term_structure,
+            'GEX': np.random.normal(1e6, 5e5, n_days),
+            'BidAskSpread': bid_ask_spread,
+            'Regime': regime_series
+        }).set_index('Date')
+        
+        market_data[asset] = df
+        
+    return market_data
+
+
 def compute_advanced_features(df):
+    """
+    Calcul des features explicatives avancées et de la Target de régression.
+    """
     data = df.copy()
     
     log_hl = np.log(data['High'] / data['Low']) ** 2
