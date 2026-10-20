@@ -23,7 +23,7 @@ def route_strategy(pred_target, z_score, term_struct, iv_atm, min_iv_thresh=0.12
 
     if pred_target < -0.015 and z_score > 1.2:
         return 'SHORT_STRADDLE'
-    elif -0.015 <= pred_target < -0.005 and 0.5 <= z_score <= 1.2:
+    elif -0.015 <= pred_target < -0.005 and 0.4 <= z_score <= 1.2:
         return 'IRON_CONDOR'
     elif pred_target > 0.01 and z_score < -0.8:
         return 'LONG_STRANGLE'
@@ -33,7 +33,7 @@ def route_strategy(pred_target, z_score, term_struct, iv_atm, min_iv_thresh=0.12
         return 'NO_TRADE'
 
 
-def run_single_experiment(seed=42, data_mode='REAL', market_regime='BEAR_STRESS', start_year=2014, end_year=2019, verbose=True):
+def run_single_experiment(seed=42, data_mode='REAL', market_regime='BEAR_STRESS', start_year=2015, end_year=2015, use_simple_split=False, verbose=True):
     assets = ['SPY', 'QQQ', 'IWM']
     
     # 1. Chargement des données
@@ -62,8 +62,6 @@ def run_single_experiment(seed=42, data_mode='REAL', market_regime='BEAR_STRESS'
     X = df_features[features]
     y = df_features['Target']
 
-    # 3. Validations croisées et Modèle
-    cv = PurgedGroupTimeSeriesSplit(n_splits=5, purge_window=5, embargo_window=5)
     model = xgb.XGBRegressor(
         n_estimators=100, max_depth=3, learning_rate=0.03,
         subsample=0.8, colsample_bytree=0.8, random_state=seed
@@ -71,7 +69,17 @@ def run_single_experiment(seed=42, data_mode='REAL', market_regime='BEAR_STRESS'
 
     all_daily_pnls = []
 
-    for fold_idx, (train_idx, test_idx) in enumerate(cv.split(X)):
+    # ------------------------------------------------------------------
+    # OPTION A : SIMPLE TRAIN/TEST SPLIT (80/20 CHRONOLOGIQUE)
+    # ------------------------------------------------------------------
+    if use_simple_split:
+        if verbose:
+            print(">>> Mode d'évaluation : SIMPLE TRAIN/TEST SPLIT (80% Train / 20% Test)...")
+        
+        split_idx = int(len(X) * 0.8)
+        train_idx = list(range(0, split_idx))
+        test_idx = list(range(split_idx, len(X)))
+
         X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
         y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
 
@@ -98,22 +106,67 @@ def run_single_experiment(seed=42, data_mode='REAL', market_regime='BEAR_STRESS'
                 size = 0.0
             position_sizes.append(size)
 
-        daily_pnls = backtest_multi_structure_strategy(
+        all_daily_pnls = backtest_multi_structure_strategy(
             df_test_period, strategy_signals, position_sizes=position_sizes
         )
-        all_daily_pnls.extend(daily_pnls)
 
         if verbose:
             mse = mean_squared_error(y_test, preds)
             n_trades = sum(1 for s in strategy_signals if s != 'NO_TRADE')
-            print(f"   Fold {fold_idx+1} - MSE: {mse:.6f} | Trades: {n_trades}")
+            print(f"   Simple Split - MSE: {mse:.6f} | Trades: {n_trades} sur {len(preds)} jours de test")
+
+    # ------------------------------------------------------------------
+    # OPTION B : PURGED GROUP TIME SERIES SPLIT (DEFAUT)
+    # ------------------------------------------------------------------
+    else:
+        if verbose:
+            print(">>> Mode d'évaluation : PURGED GROUP TIME SERIES SPLIT...")
+        
+        cv = PurgedGroupTimeSeriesSplit(n_splits=5, purge_window=5, embargo_window=5)
+
+        for fold_idx, (train_idx, test_idx) in enumerate(cv.split(X)):
+            X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+            y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+
+            model.fit(X_train, y_train)
+            preds = model.predict(X_test)
+
+            df_test_period = df_features.iloc[test_idx]
+            train_std = y_train.std() + 1e-8
+
+            strategy_signals = []
+            position_sizes = []
+
+            for i in range(len(preds)):
+                z_sc = df_test_period['Spread_ZScore'].iloc[i]
+                t_struct = df_test_period['IV_Term_Structure'].iloc[i]
+                iv_atm = df_test_period['IV_ATM'].iloc[i]
+
+                strat = route_strategy(preds[i], z_sc, t_struct, iv_atm)
+                strategy_signals.append(strat)
+
+                if strat != 'NO_TRADE':
+                    size = np.clip(np.abs(preds[i]) / train_std, 1.0, 5.0)
+                else:
+                    size = 0.0
+                position_sizes.append(size)
+
+            daily_pnls = backtest_multi_structure_strategy(
+                df_test_period, strategy_signals, position_sizes=position_sizes
+            )
+            all_daily_pnls.extend(daily_pnls)
+
+            if verbose:
+                mse = mean_squared_error(y_test, preds)
+                n_trades = sum(1 for s in strategy_signals if s != 'NO_TRADE')
+                print(f"   Fold {fold_idx+1} - MSE: {mse:.6f} | Trades: {n_trades}")
 
     # 4. Performance
     all_daily_pnls = np.array(all_daily_pnls)
     total_pnl = np.sum(all_daily_pnls)
     sharpe_ratio = (np.mean(all_daily_pnls) / (np.std(all_daily_pnls) + 1e-8)) * np.sqrt(252)
-    running_max = np.maximum.accumulate(np.cumsum(all_daily_pnls))
-    max_drawdown = np.max(running_max - np.cumsum(all_daily_pnls))
+    running_max = np.maximum.accumulate(np.cumsum(all_daily_pnls)) if len(all_daily_pnls) > 0 else np.array([0])
+    max_drawdown = np.max(running_max - np.cumsum(all_daily_pnls)) if len(all_daily_pnls) > 0 else 0.0
 
     if verbose:
         print("\n" + "="*50)
@@ -153,16 +206,24 @@ def main():
     else:
         print("\n--- Configuration de la plage de dates pour les Données Réelles ---")
         try:
-            start_yr_in = input("Entrez l'année de début (ex: 2014) [Défaut: 2014]: ").strip()
-            start_year = int(start_yr_in) if start_yr_in else 2014
+            start_yr_in = input("Entrez l'année de début (ex: 2015) [Défaut: 2015]: ").strip()
+            start_year = int(start_yr_in) if start_yr_in else 2015
             
-            end_yr_in = input("Entrez l'année de fin (ex: 2019) [Défaut: 2019]: ").strip()
-            end_year = int(end_yr_in) if end_yr_in else 2019
+            end_yr_in = input("Entrez l'année de fin (ex: 2015) [Défaut: 2015]: ").strip()
+            end_year = int(end_yr_in) if end_yr_in else 2015
         except ValueError:
-            print("Entrée invalide, utilisation des années par défaut (2014 - 2019).")
-            start_year, end_year = 2014, 2019
+            print("Entrée invalide, utilisation de l'année par défaut (2015).")
+            start_year, end_year = 2015, 2015
 
-        run_single_experiment(data_mode='REAL', start_year=start_year, end_year=end_year)
+        split_choice = input("\nUtiliser un Simple Split 80/20 à la place du Purged Group Split (Idéal pour une stratégie courte sur 1 ou 2 ans) ? (y/N) [Défaut: N]: ").strip().lower()
+        use_simple = True if split_choice == 'y' else False
+
+        run_single_experiment(
+            data_mode='REAL', 
+            start_year=start_year, 
+            end_year=end_year, 
+            use_simple_split=use_simple
+        )
 
 
 if __name__ == "__main__":

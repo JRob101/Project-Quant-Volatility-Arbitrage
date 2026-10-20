@@ -4,11 +4,6 @@ import pandas as pd
 import yfinance as yf
 from data.data_engineering import compute_advanced_features
 
-import os
-import numpy as np
-import pandas as pd
-import yfinance as yf
-
 CACHE_DIR = os.path.join(os.path.dirname(__file__), 'cache')
 
 def generate_micro_noise(n_samples, rho=0.6, sigma=0.002, seed=42):
@@ -30,11 +25,16 @@ def fetch_real_cross_asset_data(
     use_cache=True
 ):
     """
-    Télécharge les historiques réels et génère un proxy avancé de surface d'options
-    avec micro-bruit stochastique AR(1) et spreads bid-ask non-linéaires en cas de crise.
+    Télécharge les historiques réels pour SPY, QQQ et IWM via yfinance pour une plage d'années définie.
+    Permet de sélectionner une année unique si start_year == end_year (ex: 2020 à 2020 pour l'année complète 2020).
     """
     start_date = f"{start_year}-01-01"
-    end_date = f"{end_year}-01-01"
+    
+    # Si la même année est choisie pour le début et la fin, on s'arrête au 1er janvier de l'année suivante (exclusif)
+    if start_year == end_year:
+        end_date = f"{end_year + 1}-01-01"
+    else:
+        end_date = f"{end_year}-01-01"
     
     if not os.path.exists(CACHE_DIR):
         os.makedirs(CACHE_DIR)
@@ -47,6 +47,7 @@ def fetch_real_cross_asset_data(
         if use_cache and os.path.exists(cache_path):
             df = pd.read_csv(cache_path, index_col=0, parse_dates=True)
         else:
+            print(f"Téléchargement des cours réels yfinance pour {asset} [{start_date} -> {end_date}]...")
             df = yf.download(asset, start=start_date, end=end_date, progress=False)
             
             if isinstance(df.columns, pd.MultiIndex):
@@ -62,14 +63,12 @@ def fetch_real_cross_asset_data(
             df['RV_GarmanKlass'] = np.sqrt(np.maximum(0, gk_var.rolling(20).mean() * 252))
             
             # 2. Proxy IV_ATM avec Prime de Risque de Volatilité (VRP) dynamique
-            # L'IV réagit plus vite aux baisses du marché (effet de levier)
             returns_1d = df['Close'].pct_change()
             leverage_effect = np.where(returns_1d < -0.01, np.abs(returns_1d) * 1.5, 0)
             
             ewma_vol = df['RV_GarmanKlass'].ewm(span=10, adjust=False).mean()
             ar_noise = generate_micro_noise(n_obs, rho=0.6, sigma=0.003, seed=42 + idx)
             
-            # Construction de l'IV_ATM avec comportement assymétrique
             df['IV_ATM'] = np.maximum(0.08, ewma_vol + 0.015 + leverage_effect + ar_noise)
             
             # 3. Dynamic Skew & Term Structure avec Sauts de Panique
@@ -77,7 +76,6 @@ def fetch_real_cross_asset_data(
             skew_noise = generate_micro_noise(n_obs, rho=0.4, sigma=0.004, seed=100 + idx)
             df['IV_Skew'] = 0.035 - 0.20 * np.minimum(0, returns_5d) + skew_noise
             
-            # Choc de volatilité : si l'IV dépasse sa moyenne mobile 60j, la structure passe en Backwardation
             vol_ma60 = df['IV_ATM'].rolling(60).mean()
             vol_shock = (df['IV_ATM'] - vol_ma60) / (vol_ma60 + 1e-8)
             
@@ -85,11 +83,8 @@ def fetch_real_cross_asset_data(
             df['IV_Term_Structure'] = 0.025 - 0.12 * np.maximum(-0.2, vol_shock) + term_noise
             
             # 4. Microstructure : Élargissement Exponentiel du Bid-Ask Spread en Crise
-            # Le spread de base est de 1-2 bps, mais explose lors des chocs de vol (> 25% IV)
             base_spread = 0.0002
             vol_stress_multiplier = np.exp(np.maximum(0, df['IV_ATM'] - 0.20) * 12)
-            
-            # Ajout de chocs de liquidité stochastiques (Sauts de Poisson / Fat Tails)
             liquidity_jumps = np.random.poisson(lam=0.02, size=n_obs) * np.random.uniform(0.002, 0.008, size=n_obs)
             
             df['BidAskSpread'] = base_spread + (df['IV_ATM'] * 0.0005 * vol_stress_multiplier) + liquidity_jumps
