@@ -22,114 +22,105 @@ class PurgedGroupTimeSeriesSplit:
             yield list(range(0, train_end)), list(range(test_start, test_end))
 
 
-def backtest_cross_asset_strategy(market_data_test, asset_signals, position_sizes=None, holding_period=5, delta_tolerance=0.08):
+def backtest_multi_structure_strategy(
+    df_test, 
+    strategy_signals, 
+    position_sizes=None, 
+    transaction_cost_bps=0.001,
+    delta_tolerance=0.08,    # Seuil de déclenchement du Delta-Hedging
+    take_profit_pct=0.50,    # Clôture à 50% du gain max
+    stop_loss_pct=1.00       # Clôture à 100% de perte sur la prime
+):
     r = 0.04
     pnl_history = []
-    
-    first_asset = list(market_data_test.keys())[0]
-    n_days = len(market_data_test[first_asset])
-    
     if position_sizes is None:
-        position_sizes = np.ones(n_days)
+        position_sizes = np.ones(len(df_test))
     
-    t = 0
-    while t < n_days - 1:
-        strat, asset_curr = asset_signals[t]
+    current_hedge_pos = 0.0  # Position de couverture en cours d'accumulation
+    
+    for t in range(len(df_test) - 1):
+        strat = strategy_signals[t]
         size = position_sizes[t]
-        h = min(holding_period, n_days - 1 - t)
         
-        if strat == 'NO_TRADE' or size <= 0 or h <= 0 or asset_curr is None:
+        if strat == 'NO_TRADE' or size <= 0:
+            current_hedge_pos = 0.0
             pnl_history.append(0.0)
-            t += 1
             continue
             
-        df_asset = market_data_test[asset_curr]
+        S0, S1 = df_test['Close'].iloc[t], df_test['Close'].iloc[t+1]
+        sigma0, sigma1 = df_test['IV_ATM'].iloc[t], df_test['IV_ATM'].iloc[t+1]
         
-        S0 = df_asset['Close'].iloc[t]
-        sigma0 = df_asset['IV_ATM'].iloc[t]
-        dynamic_spread = df_asset['BidAskSpread'].iloc[t] if 'BidAskSpread' in df_asset.columns else 0.0002
+        # Récupération du spread réel si disponible, sinon valeur par défaut
+        spread = df_test['BidAskSpread'].iloc[t] if 'BidAskSpread' in df_test.columns else transaction_cost_bps
         
-        T_short = 30 / 252
-        T_long = 60 / 252
+        T, dt = 30 / 252, 1 / 252
         div_schedule_t0 = [(12 / 252, 1.50)]
+        div_schedule_t1 = [(t_div - dt, D) for t_div, D in div_schedule_t0 if t_div > dt]
 
+        # 1. Sélection des jambes
         if strat == 'SHORT_STRADDLE':
-            legs = [('call', S0, -1, T_short), ('put', S0, -1, T_short)]
+            legs = [('call', S0, -1), ('put', S0, -1)]
         elif strat == 'SHORT_STRANGLE':
-            kc_25 = find_strike_for_target_delta(S0, 0.25, T_short, r, div_schedule_t0, sigma0, 'call')
-            kp_25 = find_strike_for_target_delta(S0, -0.25, T_short, r, div_schedule_t0, sigma0, 'put')
-            legs = [('call', kc_25, -1, T_short), ('put', kp_25, -1, T_short)]
+            kc_25 = find_strike_for_target_delta(S0, 0.25, T, r, div_schedule_t0, sigma0, 'call')
+            kp_25 = find_strike_for_target_delta(S0, -0.25, T, r, div_schedule_t0, sigma0, 'put')
+            legs = [('call', kc_25, -1), ('put', kp_25, -1)]
         elif strat == 'IRON_CONDOR':
-            kc_25 = find_strike_for_target_delta(S0, 0.25, T_short, r, div_schedule_t0, sigma0, 'call')
-            kp_25 = find_strike_for_target_delta(S0, -0.25, T_short, r, div_schedule_t0, sigma0, 'put')
-            kc_05 = find_strike_for_target_delta(S0, 0.05, T_short, r, div_schedule_t0, sigma0, 'call')
-            kp_05 = find_strike_for_target_delta(S0, -0.05, T_short, r, div_schedule_t0, sigma0, 'put')
-            legs = [
-                ('call', kc_25, -1, T_short), ('put', kp_25, -1, T_short),
-                ('call', kc_05, +1, T_short), ('put', kp_05, +1, T_short)
-            ]
+            kc_25 = find_strike_for_target_delta(S0, 0.25, T, r, div_schedule_t0, sigma0, 'call')
+            kp_25 = find_strike_for_target_delta(S0, -0.25, T, r, div_schedule_t0, sigma0, 'put')
+            kc_10 = find_strike_for_target_delta(S0, 0.10, T, r, div_schedule_t0, sigma0, 'call')
+            kp_10 = find_strike_for_target_delta(S0, -0.10, T, r, div_schedule_t0, sigma0, 'put')
+            legs = [('call', kc_25, -1), ('put', kp_25, -1), ('call', kc_10, +1), ('put', kp_10, +1)]
         elif strat == 'LONG_STRANGLE':
-            kc_25 = find_strike_for_target_delta(S0, 0.25, T_short, r, div_schedule_t0, sigma0, 'call')
-            kp_25 = find_strike_for_target_delta(S0, -0.25, T_short, r, div_schedule_t0, sigma0, 'put')
-            legs = [('call', kc_25, +1, T_short), ('put', kp_25, +1, T_short)]
-        elif strat == 'RISK_REVERSAL':
-            kc_25 = find_strike_for_target_delta(S0, 0.25, T_short, r, div_schedule_t0, sigma0, 'call')
-            kp_25 = find_strike_for_target_delta(S0, -0.25, T_short, r, div_schedule_t0, sigma0, 'put')
-            legs = [('put', kp_25, +1, T_short), ('call', kc_25, -1, T_short)]
-        elif strat == 'CALENDAR_SPREAD':
-            legs = [('call', S0, -1, T_short), ('call', S0, +1, T_long)]
-        elif strat == 'DIAGONAL_SPREAD':
-            kc_25 = find_strike_for_target_delta(S0, 0.25, T_short, r, div_schedule_t0, sigma0, 'call')
-            kc_70_long = find_strike_for_target_delta(S0, 0.70, T_long, r, div_schedule_t0, sigma0, 'call')
-            legs = [('call', kc_25, -1, T_short), ('call', kc_70_long, +1, T_long)]
+            kc_25 = find_strike_for_target_delta(S0, 0.25, T, r, div_schedule_t0, sigma0, 'call')
+            kp_25 = find_strike_for_target_delta(S0, -0.25, T, r, div_schedule_t0, sigma0, 'put')
+            legs = [('call', kc_25, +1), ('put', kp_25, +1)]
         else:
             pnl_history.append(0.0)
-            t += 1
             continue
 
-        for step in range(h):
-            idx_curr = t + step
-            idx_next = t + step + 1
-            
-            S_curr, S_next = df_asset['Close'].iloc[idx_curr], df_asset['Close'].iloc[idx_next]
-            sig_curr, sig_next = df_asset['IV_ATM'].iloc[idx_curr], df_asset['IV_ATM'].iloc[idx_next]
-            
-            div_curr = [(td - step/252, D) for td, D in div_schedule_t0 if td > step/252]
-            div_next = [(td - (step+1)/252, D) for td, D in div_schedule_t0 if td > (step+1)/252]
+        # 2. Pricing à t0 et calcul du Delta théorique
+        val_t0, net_delta_t0 = 0.0, 0.0
+        for opt_type, K, direction in legs:
+            res = american_trinomial_option_price_and_greeks(S0, K, T, r, div_schedule_t0, sigma0, opt_type, N=60)
+            val_t0 += direction * res['price']
+            net_delta_t0 += direction * res['delta']
 
-            val_curr, net_delta_curr, open_gross_premium = 0.0, 0.0, 0.0
-            for opt_type, K, direction, mat in legs:
-                t_rem_curr = mat - (step / 252)
-                res = american_trinomial_option_price_and_greeks(S_curr, K, t_rem_curr, r, div_curr, sig_curr, opt_type, N=60)
-                val_curr += direction * res['price']
-                net_delta_curr += direction * res['delta']
-                open_gross_premium += abs(direction) * res['price']
+        # 3. Pricing à t1 (Mark-to-Market)
+        val_t1 = 0.0
+        for opt_type, K, direction in legs:
+            res = american_trinomial_option_price_and_greeks(S1, K, T - dt, r, div_schedule_t1, sigma1, opt_type, N=60)
+            val_t1 += direction * res['price']
 
-            val_next = 0.0
-            close_gross_premium = 0.0
-            for opt_type, K, direction, mat in legs:
-                t_rem_next = mat - ((step + 1) / 252)
-                res = american_trinomial_option_price_and_greeks(S_next, K, t_rem_next, r, div_next, sig_next, opt_type, N=60)
-                val_next += direction * res['price']
-                
-                if step == h - 1 and abs(direction) == 1 and res['price'] < 0.05:
-                    continue
-                close_gross_premium += abs(direction) * res['price']
-
-            daily_opt_pnl = (val_next - val_curr) * size
-            
-            if abs(net_delta_curr) > delta_tolerance:
-                hedge_pos = -net_delta_curr
+        is_short = strat in ['SHORT_STRADDLE', 'SHORT_STRANGLE', 'IRON_CONDOR']
+        raw_structure_pnl = (val_t0 - val_t1) if is_short else (val_t1 - val_t0)
+        
+        # 4. Application du Take-Profit / Stop-Loss
+        premium_base = abs(val_t0)
+        if is_short:
+            if raw_structure_pnl >= take_profit_pct * premium_base:
+                structure_pnl = take_profit_pct * premium_base * size
+            elif raw_structure_pnl <= -stop_loss_pct * premium_base:
+                structure_pnl = -stop_loss_pct * premium_base * size
             else:
-                hedge_pos = 0.0
-                
-            daily_hedge_pnl = hedge_pos * (S_next - S_curr) * size
+                structure_pnl = raw_structure_pnl * size
+        else:
+            structure_pnl = raw_structure_pnl * size
+
+        # 5. Delta-Hedging dynamique sous bande de tolérance
+        target_hedge_pos = -net_delta_t0
+        delta_gap = target_hedge_pos - current_hedge_pos
+        
+        if abs(delta_gap) > delta_tolerance:
+            trade_hedge = delta_gap
+            current_hedge_pos = target_hedge_pos
+        else:
+            trade_hedge = 0.0
             
-            traded_premium = open_gross_premium if step == 0 else (close_gross_premium if step == h - 1 else 0.0)
-            tc_day = (abs(hedge_pos) * S_curr + traded_premium) * dynamic_spread * size
-            
-            pnl_history.append(daily_opt_pnl + daily_hedge_pnl - tc_day)
-            
-        t += h
+        hedge_pnl = current_hedge_pos * (S1 - S0) * size
+        
+        # Frais de transaction
+        tc = (abs(trade_hedge) * S0 * spread + abs(val_t0) * spread) * size
+        
+        pnl_history.append(structure_pnl + hedge_pnl - tc)
         
     return np.array(pnl_history)

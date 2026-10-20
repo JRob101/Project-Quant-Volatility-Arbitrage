@@ -1,133 +1,169 @@
 import numpy as np
 import xgboost as xgb
-import pandas as pd
-from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import mean_squared_error
 import warnings
 
-from data.data_engineering import generate_multi_asset_market_data, compute_advanced_features
-from calibration.model_pipeline import PurgedGroupTimeSeriesSplit, backtest_cross_asset_strategy
+from data.data_engineering import (
+    generate_multi_asset_market_data, 
+    generate_dynamic_market_data, 
+    compute_advanced_features
+)
+from data.fetch_real_data import fetch_real_cross_asset_data
+from calibration.model_pipeline import PurgedGroupTimeSeriesSplit, backtest_multi_structure_strategy
 
 warnings.filterwarnings('ignore')
 
-CLASS_MAP = {
-    0: 'NO_TRADE',
-    1: 'IRON_CONDOR',
-    2: 'LONG_STRANGLE',
-    3: 'RISK_REVERSAL',
-    4: 'CALENDAR_SPREAD',
-    5: 'DIAGONAL_SPREAD'
-}
 
-def run_single_experiment(seed=42, market_regime='BULL_STABLE', verbose=False):
+def route_strategy(pred_target, z_score, term_struct, iv_atm, min_iv_thresh=0.12):
+    """
+    Routage conditionnel avec Filtre Macro (IV Min & Term Structure).
+    """
+    if iv_atm < min_iv_thresh or term_struct < -0.05:
+        return 'NO_TRADE'
+
+    if pred_target < -0.015 and z_score > 1.2:
+        return 'SHORT_STRADDLE'
+    elif -0.015 <= pred_target < -0.005 and 0.5 <= z_score <= 1.2:
+        return 'IRON_CONDOR'
+    elif pred_target > 0.01 and z_score < -0.8:
+        return 'LONG_STRANGLE'
+    elif pred_target < -0.005:
+        return 'SHORT_STRANGLE'
+    else:
+        return 'NO_TRADE'
+
+
+def run_single_experiment(seed=42, data_mode='REAL', market_regime='BEAR_STRESS', start_year=2014, end_year=2019, verbose=True):
     assets = ['SPY', 'QQQ', 'IWM']
-    raw_market_data = generate_multi_asset_market_data(n_days=1500, assets=assets, seed=seed, market_regime=market_regime)
     
-    features_by_asset = {}
-    for asset in assets:
-        features_by_asset[asset] = compute_advanced_features(raw_market_data[asset])
-        
-    features_list = [
-        'RV_GarmanKlass', 'Vol_Premium', 'Spread_ZScore', 
-        'Term_Structure_ZScore', 'Slope_Momentum',
-        'GEX_Normalized', 'Skew_Momentum', 'IV_Term_Structure', 'IV_EWMA_Diff'
-    ]
+    # 1. Chargement des données
+    if data_mode == 'REAL':
+        if verbose:
+            print(f"\n>>> Chargement des DONNÉES RÉELLES de marché (SPY, QQQ, IWM via yfinance {start_year}-{end_year})...")
+        raw_market_data = fetch_real_cross_asset_data(
+            assets=assets, 
+            start_year=start_year, 
+            end_year=end_year, 
+            use_cache=False
+        )
+    elif data_mode == 'SYNTHETIC_DYNAMIC':
+        if verbose:
+            print("\n>>> Génération des DONNÉES SYNTHÉTIQUES DYNAMIQUES (Markov-Switching)...")
+        raw_market_data = generate_dynamic_market_data(n_days=1260, assets=assets, seed=seed, verbose=verbose)
+    else:
+        if verbose:
+            print(f"\n>>> Génération des DONNÉES SYNTHÉTIQUES STATIQUES (Régime: {market_regime})...")
+        raw_market_data = generate_multi_asset_market_data(n_days=1500, assets=assets, seed=seed, market_regime=market_regime)
+
+    # 2. Feature Engineering
+    df_features = compute_advanced_features(raw_market_data['SPY'])
     
-    df_global_list = []
-    for asset in assets:
-        df_a = features_by_asset[asset].copy()
-        df_a['Asset'] = asset
-        df_global_list.append(df_a)
-    df_global = pd.concat(df_global_list, axis=0)
-    
-    ref_asset_df = features_by_asset['SPY']
-    X_ref = ref_asset_df[features_list]
+    features = ['RV_GarmanKlass', 'Vol_Premium', 'Spread_ZScore', 'GEX_Normalized', 'Skew_Momentum', 'IV_Term_Structure']
+    X = df_features[features]
+    y = df_features['Target']
+
+    # 3. Validations croisées et Modèle
     cv = PurgedGroupTimeSeriesSplit(n_splits=5, purge_window=5, embargo_window=5)
-    
-    prob_thresh = 0.45
-    K_max = 3
+    model = xgb.XGBRegressor(
+        n_estimators=100, max_depth=3, learning_rate=0.03,
+        subsample=0.8, colsample_bytree=0.8, random_state=seed
+    )
+
     all_daily_pnls = []
 
-    for fold_idx, (train_idx, test_idx) in enumerate(cv.split(X_ref)):
-        test_dates = ref_asset_df.index[test_idx]
-        train_dates = ref_asset_df.index[train_idx]
-        
-        df_train_fold = df_global[df_global.index.isin(train_dates)]
-        X_train = df_train_fold[features_list]
-        y_train = df_train_fold['Target']
-        
-        le = LabelEncoder()
-        y_train_encoded = le.fit_transform(y_train)
-        n_classes_fold = len(le.classes_)
-        
-        model = xgb.XGBClassifier(
-            n_estimators=100, max_depth=3, learning_rate=0.03,
-            subsample=0.8, colsample_bytree=0.8,
-            objective='multi:softprob', num_class=n_classes_fold, random_state=42
-        )
-        model.fit(X_train, y_train_encoded)
-        
-        proba_by_asset = {}
-        market_data_test = {}
-        for asset in assets:
-            df_test_asset = features_by_asset[asset].reindex(test_dates).dropna()
-            X_test_asset = df_test_asset[features_list]
-            proba_by_asset[asset] = model.predict_proba(X_test_asset)
-            market_data_test[asset] = df_test_asset
-            
-        n_test_days = len(test_dates)
-        fold_daily_pnls = np.zeros(n_test_days)
-        
-        for t in range(n_test_days):
-            candidates = []
-            for asset in assets:
-                if t < len(proba_by_asset[asset]):
-                    probs = proba_by_asset[asset][t]
-                    best_class_enc = int(np.argmax(probs))
-                    p_val = probs[best_class_enc]
-                    real_class = le.inverse_transform([best_class_enc])[0]
-                    
-                    if real_class != 0 and p_val >= prob_thresh:
-                        candidates.append({'asset': asset, 'prob': p_val, 'strat': CLASS_MAP[real_class]})
-            
-            candidates = sorted(candidates, key=lambda x: x['prob'], reverse=True)[:K_max]
-            
-            if len(candidates) > 0:
-                size_per_trade = 3.5 / len(candidates)
-                day_pnl_sum = 0.0
-                for cand in candidates:
-                    single_position_sizes = [0.0] * n_test_days
-                    single_position_sizes[t] = size_per_trade
-                    pnl_arr = backtest_cross_asset_strategy(
-                        market_data_test, 
-                        [(cand['strat'], cand['asset']) if i == t else ('NO_TRADE', None) for i in range(n_test_days)],
-                        position_sizes=single_position_sizes, 
-                        holding_period=5
-                    )
-                    day_pnl_sum += pnl_arr[t] if t < len(pnl_arr) else 0.0
-                fold_daily_pnls[t] = day_pnl_sum
+    for fold_idx, (train_idx, test_idx) in enumerate(cv.split(X)):
+        X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+        y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+
+        model.fit(X_train, y_train)
+        preds = model.predict(X_test)
+
+        df_test_period = df_features.iloc[test_idx]
+        train_std = y_train.std() + 1e-8
+
+        strategy_signals = []
+        position_sizes = []
+
+        for i in range(len(preds)):
+            z_sc = df_test_period['Spread_ZScore'].iloc[i]
+            t_struct = df_test_period['IV_Term_Structure'].iloc[i]
+            iv_atm = df_test_period['IV_ATM'].iloc[i]
+
+            strat = route_strategy(preds[i], z_sc, t_struct, iv_atm)
+            strategy_signals.append(strat)
+
+            if strat != 'NO_TRADE':
+                size = np.clip(np.abs(preds[i]) / train_std, 1.0, 5.0)
             else:
-                fold_daily_pnls[t] = 0.0
-                
-        all_daily_pnls.extend(fold_daily_pnls)
-        
+                size = 0.0
+            position_sizes.append(size)
+
+        daily_pnls = backtest_multi_structure_strategy(
+            df_test_period, strategy_signals, position_sizes=position_sizes
+        )
+        all_daily_pnls.extend(daily_pnls)
+
+        if verbose:
+            mse = mean_squared_error(y_test, preds)
+            n_trades = sum(1 for s in strategy_signals if s != 'NO_TRADE')
+            print(f"   Fold {fold_idx+1} - MSE: {mse:.6f} | Trades: {n_trades}")
+
+    # 4. Performance
     all_daily_pnls = np.array(all_daily_pnls)
     total_pnl = np.sum(all_daily_pnls)
     sharpe_ratio = (np.mean(all_daily_pnls) / (np.std(all_daily_pnls) + 1e-8)) * np.sqrt(252)
-    max_drawdown = np.max(np.maximum.accumulate(np.cumsum(all_daily_pnls)) - np.cumsum(all_daily_pnls))
-    
+    running_max = np.maximum.accumulate(np.cumsum(all_daily_pnls))
+    max_drawdown = np.max(running_max - np.cumsum(all_daily_pnls))
+
     if verbose:
-        print("\n" + "="*65)
-        print(f"   EVALUATION UNIQUE | Regime: {market_regime} | Seed: {seed}")
-        print("="*65)
+        print("\n" + "="*50)
+        print(f"   RÉSULTATS DE LA STRATÉGIE ({data_mode})")
+        print("="*50)
         print(f"   PnL Cumulé Net :         ${total_pnl:.2f}")
         print(f"   Ratio de Sharpe Annuel :  {sharpe_ratio:.2f}")
         print(f"   Max Drawdown ($) :        ${max_drawdown:.2f}")
-        print("="*65)
-        
+        print("="*50 + "\n")
+
     return total_pnl, sharpe_ratio, max_drawdown
 
+
 def main():
-    run_single_experiment(seed=42, market_regime='BULL_STABLE', verbose=True)
+    print("="*65)
+    print("      LANCEMENT DU BACKTEST D'ARBITRAGE DE VOLATILITÉ")
+    print("="*65)
+    print("\nChoisissez le type de données à utiliser :")
+    print(" 1. Données Réelles de Marché (SPY, QQQ, IWM via yfinance avec plage au choix)")
+    print(" 2. Données Synthétiques Dynamiques (Simulation Markov-Switching sur 5 ans)")
+    print(" 3. Données Synthétiques Statiques (Régime de Marché Fixe)")
+
+    choice = input("\nVotre choix (1-3) [Défaut: 1]: ").strip()
+
+    if choice == '2':
+        run_single_experiment(data_mode='SYNTHETIC_DYNAMIC')
+    elif choice == '3':
+        print("\nChoix du régime statique :")
+        print(" a. BULL_STABLE")
+        print(" b. BEAR_STRESS")
+        print(" c. HIGH_VOL_OF_VOL")
+        print(" d. JUMP_CRASH")
+        reg_choice = input("Sélectionnez le régime (a-d) [Défaut: b]: ").strip().lower()
+        reg_map = {'a': 'BULL_STABLE', 'b': 'BEAR_STRESS', 'c': 'HIGH_VOL_OF_VOL', 'd': 'JUMP_CRASH'}
+        selected_regime = reg_map.get(reg_choice, 'BEAR_STRESS')
+        run_single_experiment(data_mode='SYNTHETIC_STATIC', market_regime=selected_regime)
+    else:
+        print("\n--- Configuration de la plage de dates pour les Données Réelles ---")
+        try:
+            start_yr_in = input("Entrez l'année de début (ex: 2014) [Défaut: 2014]: ").strip()
+            start_year = int(start_yr_in) if start_yr_in else 2014
+            
+            end_yr_in = input("Entrez l'année de fin (ex: 2019) [Défaut: 2019]: ").strip()
+            end_year = int(end_yr_in) if end_yr_in else 2019
+        except ValueError:
+            print("Entrée invalide, utilisation des années par défaut (2014 - 2019).")
+            start_year, end_year = 2014, 2019
+
+        run_single_experiment(data_mode='REAL', start_year=start_year, end_year=end_year)
+
 
 if __name__ == "__main__":
     main()
